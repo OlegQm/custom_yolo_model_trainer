@@ -57,7 +57,6 @@ class Detect_HailoFriendly(Detect):
         self.cv2 = nn.ModuleList(nn.Conv2d(c, 4 * self.bins, 1) for c in ch)
         self.cv3 = nn.ModuleList(nn.Conv2d(c, nc, 1) for c in ch)
         self.dfl = DFL(self.bins)
-        self.grids = [self._make_grid(s) for s in stride]
 
     @staticmethod
     def _make_grid(s, img=640):
@@ -74,6 +73,12 @@ class Detect_HailoFriendly(Detect):
         hw = img // s
         y, x = torch.meshgrid(torch.arange(hw), torch.arange(hw), indexing="ij")
         return torch.stack((x, y), 2).float()
+
+    def _make_grid_dynamic(self, h, w, device):
+        y, x = torch.meshgrid(torch.arange(h, device=device),
+                          torch.arange(w, device=device),
+                          indexing="ij")
+        return torch.stack((x, y), 2).float()       # (h, w, 2)
 
     def forward(self, x):
         """
@@ -96,7 +101,7 @@ class Detect_HailoFriendly(Detect):
             d = self.dfl(rd.flatten(2))                  # (B, 4, h*w)
             d = d.view(B, 4, h * w).permute(0, 2, 1).view(B, h, w, 4)
 
-            g  = self.grids[i][:h, :w].to(rd.device)
+            g = self._make_grid_dynamic(h, w, rd.device)
             xy = ((d[..., :2].sigmoid() * 2 - 0.5) + g) * float(self.stride[i])
             wh = ((d[..., 2:4].sigmoid() * 2) ** 2)      * float(self.stride[i])
             box = torch.cat((xy - wh / 2, xy + wh / 2), -1)
