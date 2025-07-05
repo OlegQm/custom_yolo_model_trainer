@@ -1,0 +1,58 @@
+# yolov8m_p2_se.yaml
+# Ultralytics YOLOv8-m (custom)  –– P2-output + wide SPPF + SE-attention
+# ------------------------------------------------------------------------------------------------------------------
+nc: 14                  # number of classes
+depth_multiple: 0.67    # “m” scale - depth
+width_multiple: 0.75    # “m” scale - width
+max_channels: 768       # upper channel limit for this scale (used in SPPF)
+
+# ------------------------------------------------ BACKBONE --------------------------------------------------------
+# [from, repeats, module, args]
+backbone:
+  - [-1, 1, ConvSE, [64, 3, 2]]                   # 0  P1/2
+  - [-1, 1, ConvSE, [128, 3, 2]]                  # 1  P2/4
+  - [-1, 3, C2f,   [128, True, ConvSE]]           # 2
+  - [-1, 1, ConvSE, [256, 3, 2]]                  # 3  P3/8
+  - [-1, 6, C2f,   [256, True, ConvSE]]           # 4
+  - [-1, 1, ConvSE, [512, 3, 2]]                  # 5  P4/16
+  - [-1, 6, C2f,   [512, True, ConvSE]]           # 6
+  - [-1, 1, ConvSE, [768, 3, 2]]                  # 7  P5/32
+  - [-1, 3, C2f,   [768, True, ConvSE]]           # 8
+  - [-1, 1, SPPF,  [768, 7]]                      # 9  wide-kernel SPPF (k=7)
+
+# ------------------------------------------------- HEAD -----------------------------------------------------------
+# P-levels:  P2/4 - P5/32 (four-scale detect)
+head:
+  # ----- up to P4 (stride 16) -------------------------------------------------
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]    # 10
+  - [[-1, 6], 1, Concat, [1]]                     # 11  concat with backbone P4
+  - [-1, 3, C2f, [512, False, ConvSE]]            # 12  P4/16
+
+  # ----- up to P3 (stride 8) --------------------------------------------------
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]    # 13
+  - [[-1, 4], 1, Concat, [1]]                     # 14  concat with backbone P3
+  - [-1, 3, C2f, [256, False, ConvSE]]            # 15  P3/8
+
+  # ----- new P2 branch (stride 4) --------------------------------------------
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]    # 16
+  - [[-1, 2], 1, Concat, [1]]                     # 17  concat with backbone P2
+  - [-1, 2, C2f, [128, False, ConvSE]]            # 18  P2/4 (tiny)
+
+  # ----- down-path back to P3 -------------------------------------------------
+  - [-1, 1, ConvSE, [128, 3, 2]]                  # 19  downsample → stride 8
+  - [[-1, 15], 1, Concat, [1]]                    # 20
+  - [-1, 2, C2f, [256, False, ConvSE]]            # 21  P3/8
+
+  # ----- down-path to P4 ------------------------------------------------------
+  - [-1, 1, ConvSE, [256, 3, 2]]                  # 22  stride 16
+  - [[-1, 12], 1, Concat, [1]]                    # 23
+  - [-1, 2, C2f, [512, False, ConvSE]]            # 24  P4/16
+
+  # ----- down-path to P5 ------------------------------------------------------
+  - [-1, 1, ConvSE, [512, 3, 2]]                  # 25  stride 32
+  - [[-1, 9], 1, Concat, [1]]                     # 26
+  - [-1, 2, C2f, [768, False, ConvSE]]            # 27  P5/32
+
+  # ----- Detect head (P2–P5) --------------------------------------------------
+  - [[18, 21, 24, 27], 1, Detect_HailoFriendly, [nc]]           # 28  Detect(P2, P3, P4, P5)
+
