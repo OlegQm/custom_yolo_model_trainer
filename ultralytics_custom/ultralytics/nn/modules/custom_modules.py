@@ -40,7 +40,7 @@ class ConvSE(nn.Module):
         return self.se(self.conv(x))
 
 
-class Detect_HailoFriendly(Detect):
+class Detect_HailoFull(Detect):
     """
     Fully "Hailo-self-contained" YOLOv8 head.
 
@@ -113,7 +113,6 @@ class Detect_HailoFriendly(Detect):
             return feats
 
         boxes, scores = [], []
-        A_offset = 0
         for i in range(self.nl):
             rd, rc = feats[i].split((4 * self.reg_max, self.nc), 1)
             bs, _, h, w = rd.shape
@@ -123,7 +122,7 @@ class Detect_HailoFriendly(Detect):
                 .mul(torch.arange(self.reg_max, device=rd.device)
                      .view(1, 1, -1, 1, 1))
                 .sum(2)
-            )
+            )  # (bs, 4, h, w)
             yv, xv = torch.meshgrid(
                 torch.arange(h, device=rd.device),
                 torch.arange(w, device=rd.device),
@@ -133,17 +132,22 @@ class Detect_HailoFriendly(Detect):
             s = self.stride_f[i].to(rd.device)
             xy = ((rd[:, :2].sigmoid() * 2 - 0.5) + grid) * s
             wh = ((rd[:, 2:4].sigmoid() * 2).square()) * s
-            box = torch.cat((xy - wh / 2, xy + wh / 2), 1)
-            boxes.append(box.flatten(2).permute(0, 2, 1))
-            scores.append(rc.sigmoid().flatten(2).permute(0, 2, 1))
+            box = torch.cat((xy - wh / 2, xy + wh / 2), 1)  # (bs, 4, h, w)
+            box = box.permute(0, 2, 3, 1).reshape(bs, -1, 4)  # (bs, h, w, 4) → (bs, h*w, 4)
+            cls = rc.sigmoid().permute(0, 2, 3, 1).reshape(bs, -1, self.nc)  # (bs, h, w, nc) → (bs, h*w, nc)
+            boxes.append(box)
+            scores.append(cls)
+
+        boxes = torch.cat(boxes, 1)   # (bs, sum(h*w), 4)
+        scores = torch.cat(scores, 1) # (bs, sum(h*w), nc)
 
         pred = torch.cat(
             (
-                torch.cat(boxes, 1),
-                torch.ones_like(boxes[0][..., :1]),
-                torch.cat(scores, 1),
+                boxes,                                   # (bs, A, 4)
+                torch.ones_like(boxes[..., :1]),         # (bs, A, 1)
+                scores,                                  # (bs, A, nc)
             ),
-            2,
+            2,                                          # (bs, A, 5+nc)
         )
         return pred, feats
 
