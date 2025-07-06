@@ -42,21 +42,23 @@ class ConvSE(nn.Module):
 
 class Detect_HailoFriendly(Detect):
     """
-    Train/PyTorch-inference:
-        Returns already decoded (boxes, scores).
-    Export (ONNX to Hailo):
-        Returns 8 raw tensors
-        [bbox_P3, cls_P3, ..., bbox_P6, cls_P6].
-        DFL, decode, and NMS are performed in Hailo SDK.
+    ------------------------------------------------------------------------------
+    * Train / PyTorch-inference
+        • Returns raw tensors [B, 78, H, W] (list per level) → loss.
+        • If not self.training, also decodes to (boxes, scores).
+
+    * Export (ONNX → Hailo)
+        • Outputs 8 tensors [bbox_P3, cls_P3, ..., bbox_P6, cls_P6].
+        • DFL-integral, decode, and NMS are performed in Hailo SDK/Host-CPU.
+    ------------------------------------------------------------------------------
     """
-    def __init__(self,
-                 nc: int = 14,
-                 ch: tuple = (),
-                 reg_max: int = 16,
-                 stride: tuple = (4, 8, 16, 32)):
-        """
-        Initialize Detect_HailoFriendly module.
-        """
+    def __init__(
+        self,
+        nc: int = 14,
+        ch: tuple = (),
+        reg_max: int = 16,
+        stride: tuple = (4, 8, 16, 32)
+    ):
         super().__init__(nc=nc, ch=ch)
         self.nc = nc
         self.reg_max = reg_max
@@ -67,44 +69,43 @@ class Detect_HailoFriendly(Detect):
         self.dfl = DFL(reg_max)
 
     def forward(self, x):
-        """
-        Forward pass for Detect_HailoFriendly.
-        In export mode, returns raw bbox and cls tensors.
-        In train/inference mode, returns decoded boxes and scores.
-        """
         if getattr(self, "export", False):
-            outs = []
+            out = []
             for i in range(self.nl):
-                outs += [self.bbox[i](x[i]), self.cls[i](x[i])]
-            return outs
+                out.extend((self.bbox[i](x[i]), self.cls[i](x[i])))
+            return out
 
-        raw_maps, boxes, scores = [], [], []
+        feats, boxes, scores = [], [], []
         for i in range(self.nl):
-            feat = x[i]
-            rd = self.bbox[i](feat)
-            rc = self.cls[i](feat)
-            B, _, h, w = rd.shape
-            raw_maps.append(torch.cat((rd, rc), 1))
-            d = self.dfl(rd).permute(0, 2, 3, 1)
-            yv, xv = torch.meshgrid(torch.arange(h, device=feat.device),
-                                    torch.arange(w, device=feat.device),
-                                    indexing='ij')
-            grid = torch.stack((xv, yv), 2).float()
-            xy = ((d[..., :2].sigmoid() * 2 - 0.5) + grid) * self.stride[i]
-            wh = ((d[..., 2:4].sigmoid() * 2) ** 2) * self.stride[i]
-            box = torch.cat((xy - wh / 2, xy + wh / 2), -1)
-            boxes.append(box.view(B, -1, 4))
-            scores.append(rc.permute(0, 2, 3, 1).reshape(B, -1, self.nc))
+            rd = self.bbox[i](x[i])
+            rc = self.cls[i](x[i])
+            feats.append(torch.cat((rd, rc), 1))
+
+            if not self.training:
+                B, _, h, w = rd.shape
+                d = self.dfl(rd.flatten(2))
+                d = d.view(B, 4, h, w).permute(0, 2, 3, 1)
+                yv, xv = torch.meshgrid(torch.arange(h, device=rd.device),
+                                       torch.arange(w, device=rd.device),
+                                       indexing='ij')
+                grid = torch.stack((xv, yv), 2).float()
+                xy = ((d[..., :2].sigmoid() * 2 - 0.5) + grid) * self.stride[i]
+                wh = ((d[..., 2:4].sigmoid() * 2) ** 2) * self.stride[i]
+                box = torch.cat((xy - wh / 2, xy + wh / 2), -1)
+                boxes.append(box.reshape(B, -1, 4))
+                scores.append(rc.permute(0, 2, 3, 1).reshape(B, -1, self.nc))
 
         if self.training:
-            return raw_maps
+            return feats
 
         return torch.cat(boxes, 1), torch.cat(scores, 1).sigmoid()
 
     def bias_init(self):
         """
-        Initialize biases for faster convergence as in Ultralytics Detect.
+        Initializes as in Ultralytics to speed up cls-head convergence.
         """
         for b, c, s in zip(self.bbox, self.cls, self.stride):
             b.bias.data.fill_(1.0)
-            c.bias.data[:self.nc] = math.log(5 / self.nc / (640 / s) ** 2)
+            c.bias.data[:self.nc] = math.log(
+                5 / self.nc / (640 / s) ** 2
+            )
