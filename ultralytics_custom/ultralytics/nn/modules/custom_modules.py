@@ -52,21 +52,15 @@ class Detect_HailoFriendly(Detect):
         • DFL-integral, decode, and NMS are performed in Hailo SDK/Host-CPU.
     ------------------------------------------------------------------------------
     """
-    def __init__(
-        self,
-        nc: int = 14,
-        ch: tuple = (),
-        reg_max: int = 16,
-        stride: tuple = (4, 8, 16, 32)
-    ):
+    def __init__(self, nc=14, ch=(), reg_max=16, stride=(4, 8, 16, 32)):
         super().__init__(nc=nc, ch=ch)
-        self.nc = nc
-        self.reg_max = reg_max
+        self.nc, self.reg_max = nc, reg_max
         self.no = nc + 4 * reg_max
-        self.stride = torch.tensor(stride)
-        self.bbox = nn.ModuleList(nn.Conv2d(c, 4 * reg_max, 1) for c in ch)
-        self.cls = nn.ModuleList(nn.Conv2d(c, nc, 1) for c in ch)
-        self.dfl = DFL(reg_max)
+        self.stride = torch.tensor(stride, dtype=torch.float32)
+
+        self.bbox = nn.ModuleList([nn.Conv2d(c, 4 * reg_max, 1) for c in ch])
+        self.cls  = nn.ModuleList([nn.Conv2d(c, nc,           1) for c in ch])
+        self.dfl  = DFL(reg_max)
 
     def forward(self, x):
         if getattr(self, "export", False):
@@ -75,28 +69,38 @@ class Detect_HailoFriendly(Detect):
                 out.extend((self.bbox[i](x[i]), self.cls[i](x[i])))
             return out
 
-        feats, boxes, scores = [], [], []
+        if self.training:
+            feats = []
+            for i in range(self.nl):
+                rd = self.bbox[i](x[i])           # (B, 4*reg_max, H, W)
+                rc = self.cls[i](x[i])            # (B, nc,        H, W)
+                y  = torch.cat((rd, rc), 1)       # (B, no,        H, W)
+                bs, _, h, w = y.shape
+                feats.append(y.view(bs, self.no, h * w))  # (B, no, H*W)
+            return feats
+
+
+        boxes, scores = [], []
         for i in range(self.nl):
             rd = self.bbox[i](x[i])
             rc = self.cls[i](x[i])
-            feats.append(torch.cat((rd, rc), 1))
 
-            if not self.training:
-                B, _, h, w = rd.shape
-                d = self.dfl(rd.flatten(2))
-                d = d.view(B, 4, h, w).permute(0, 2, 3, 1)
-                yv, xv = torch.meshgrid(torch.arange(h, device=rd.device),
-                                       torch.arange(w, device=rd.device),
-                                       indexing='ij')
-                grid = torch.stack((xv, yv), 2).float()
-                xy = ((d[..., :2].sigmoid() * 2 - 0.5) + grid) * self.stride[i]
-                wh = ((d[..., 2:4].sigmoid() * 2) ** 2) * self.stride[i]
-                box = torch.cat((xy - wh / 2, xy + wh / 2), -1)
-                boxes.append(box.reshape(B, -1, 4))
-                scores.append(rc.permute(0, 2, 3, 1).reshape(B, -1, self.nc))
+            B, _, h, w = rd.shape
+            d = self.dfl(rd.flatten(2)).view(B, 4, h, w).permute(0, 2, 3, 1)
 
-        if self.training:
-            return feats
+            s = self.stride[i].to(rd.device)
+            yv, xv = torch.meshgrid(torch.arange(h, device=rd.device),
+                                   torch.arange(w, device=rd.device),
+                                   indexing='ij')
+            grid = torch.stack((xv, yv), 2).float()
+
+            xy = ((d[..., :2].sigmoid() * 2 - 0.5) + grid) * s
+            wh = ((d[..., 2:4].sigmoid() * 2) ** 2)       * s
+            box = torch.cat((xy - wh / 2, xy + wh / 2), -1)
+
+            boxes.append(box.reshape(B, -1, 4))
+            scores.append(rc.permute(0, 2, 3, 1)
+                            .reshape(B, -1, self.nc))
 
         return torch.cat(boxes, 1), torch.cat(scores, 1).sigmoid()
 
@@ -109,3 +113,4 @@ class Detect_HailoFriendly(Detect):
             c.bias.data[:self.nc] = math.log(
                 5 / self.nc / (640 / s) ** 2
             )
+
