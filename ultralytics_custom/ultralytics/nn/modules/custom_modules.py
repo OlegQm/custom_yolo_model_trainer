@@ -42,21 +42,31 @@ class ConvSE(nn.Module):
 
 class Detect_HailoFriendly(Detect):
     """
-    YOLOv8 head, fully exportable to HEF:
-      • train/val returns standard feature maps (compatible with Ultralytics loss)
-      • export branch performs:
-          1) softmax → DFL-integral  (64 → 4)
-          2) decode  ((σ*2−0.5)+grid)*stride, ((σ*2)**2)*stride
-          3) sigmoid for cls
-      • Outputs 8 tensors (bbox_P2…P5, cls_P2…P5)
-        — these are used for `nms_postprocess` in Hailo.
+    Fully "Hailo-self-contained" YOLOv8 head.
+
+    • **train / val**  
+      - returns a list of 4-D maps (B, no, H, W) — compatible with ComputeLoss.
+
+    • **eval (validator / inference on GPU/CPU)**  
+      - returns `(pred, feats)`, where  
+        `pred` – tensor (B, A, 5+nc) [x1,y1,x2,y2,obj,cls…]  
+        `feats` – same list of maps for validator loss.
+
+    • **export (ONNX → Hailo)**  
+      - inside the graph performs  
+        1) Softmax + DFL-integral (64→4)  
+        2) Decode (grid, stride)  
+        3) Sigmoid for cls  
+      - outputs 8 tensors: 4 bbox_P*, 4 cls_P* (for `nms_postprocess`).
     """
 
-    def __init__(self,
-                 nc: int = 14,
-                 ch: tuple = (),
-                 reg_max: int = 16,
-                 stride: tuple = (4, 8, 16, 32)):
+    def __init__(
+        self,
+        nc: int = 14,
+        ch: tuple = (),
+        reg_max: int = 16,
+        stride: tuple = (4, 8, 16, 32),
+    ):
         super().__init__(nc=nc, ch=ch)
         self.nc = nc
         self.reg_max = reg_max
@@ -64,7 +74,6 @@ class Detect_HailoFriendly(Detect):
         self.stride_f = torch.tensor(stride, dtype=torch.float32)
         self.bbox = nn.ModuleList([nn.Conv2d(c, 4 * reg_max, 1) for c in ch])
         self.cls  = nn.ModuleList([nn.Conv2d(c, nc, 1) for c in ch])
-        self.dfl  = DFL(reg_max)
 
     def forward(self, x):
         if getattr(self, "export", False):
@@ -73,11 +82,16 @@ class Detect_HailoFriendly(Detect):
                 rd = self.bbox[i](x[i])
                 rc = self.cls[i](x[i])
                 B, _, H, W = rd.shape
-                rd = rd.view(B, 4, self.reg_max, H, W)
-                rd = rd.softmax(2)
-                bins = torch.arange(self.reg_max, dtype=rd.dtype, device=rd.device).view(1,1,-1,1,1)
+                rd = rd.view(B, 4, self.reg_max, H, W).softmax(2)
+                bins = torch.arange(
+                    self.reg_max, dtype=rd.dtype, device=rd.device
+                ).view(1, 1, -1, 1, 1)
                 rd = (rd * bins).sum(2)
-                yv, xv = torch.meshgrid(torch.arange(H, device=rd.device), torch.arange(W, device=rd.device), indexing='ij')
+                yv, xv = torch.meshgrid(
+                    torch.arange(H, device=rd.device),
+                    torch.arange(W, device=rd.device),
+                    indexing="ij",
+                )
                 grid = torch.stack((xv, yv), 0).float()
                 s = self.stride_f[i].to(rd.device)
                 xy = ((rd[:, :2].sigmoid() * 2 - 0.5) + grid) * s
@@ -94,12 +108,46 @@ class Detect_HailoFriendly(Detect):
             feats.append(feat)
             bs, _, h, w = feat.shape
             y_parts.append(feat.view(bs, self.no, h * w))
+
         if self.training:
             return feats
-        y = torch.cat(y_parts, 2)
-        return y, feats
+
+        boxes, scores = [], []
+        A_offset = 0
+        for i in range(self.nl):
+            rd, rc = feats[i].split((4 * self.reg_max, self.nc), 1)
+            bs, _, h, w = rd.shape
+            rd = (
+                rd.view(bs, 4, self.reg_max, h, w)
+                .softmax(2)
+                .mul(torch.arange(self.reg_max, device=rd.device)
+                     .view(1, 1, -1, 1, 1))
+                .sum(2)
+            )
+            yv, xv = torch.meshgrid(
+                torch.arange(h, device=rd.device),
+                torch.arange(w, device=rd.device),
+                indexing="ij",
+            )
+            grid = torch.stack((xv, yv), 0).float()
+            s = self.stride_f[i].to(rd.device)
+            xy = ((rd[:, :2].sigmoid() * 2 - 0.5) + grid) * s
+            wh = ((rd[:, 2:4].sigmoid() * 2).square()) * s
+            box = torch.cat((xy - wh / 2, xy + wh / 2), 1)
+            boxes.append(box.flatten(2).permute(0, 2, 1))
+            scores.append(rc.sigmoid().flatten(2).permute(0, 2, 1))
+
+        pred = torch.cat(
+            (
+                torch.cat(boxes, 1),
+                torch.ones_like(boxes[0][..., :1]),
+                torch.cat(scores, 1),
+            ),
+            2,
+        )
+        return pred, feats
 
     def bias_init(self):
         for b, c, s in zip(self.bbox, self.cls, self.stride_f):
             b.bias.data.fill_(1.0)
-            c.bias.data[:self.nc] = math.log(5 / self.nc / (640 / s) ** 2)
+            c.bias.data[: self.nc] = math.log(5 / self.nc / (640 / s) ** 2)
